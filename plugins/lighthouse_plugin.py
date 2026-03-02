@@ -10,7 +10,12 @@ if not logging_started():
 
 logger.debug("Resolving disassembler platform for plugin...")
 
-if disassembler.headless:
+if disassembler.headless and disassembler.NAME == "IDA":
+    logger.info("Disassembler '%s' is running headlessly" % disassembler.NAME)
+    logger.info(" - Loading Lighthouse in headless/MCP-only mode")
+    from lighthouse.integration.ida_loader import *
+
+elif disassembler.headless:
     logger.info("Disassembler '%s' is running headlessly" % disassembler.NAME)
     logger.info(" - Lighthouse is not supported in headless modes (yet!)")
 

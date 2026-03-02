@@ -54,11 +54,13 @@ class LighthouseContext(object):
         self.core.palette.warmup()
         self.metadata.start()
         self.director.start()
-        self.painter.start()
 
-        # TODO/BINJA remove this ASAP, or find a better workaround... I hate having this here
-        if disassembler.NAME == "BINJA":
-            disassembler.hide_dockable("Feature Map")
+        if not disassembler.headless:
+            self.painter.start()
+
+            # TODO/BINJA remove this ASAP, or find a better workaround... I hate having this here
+            if disassembler.NAME == "BINJA":
+                disassembler.hide_dockable("Feature Map")
 
         self._started = True
 
@@ -68,7 +70,8 @@ class LighthouseContext(object):
         """
         if not self._started:
             return
-        self.painter.terminate()
+        if not disassembler.headless:
+            self.painter.terminate()
         self.director.terminate()
         self.metadata.terminate()
 

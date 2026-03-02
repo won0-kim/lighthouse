@@ -371,7 +371,7 @@ class CoverageDirector(object):
     # Coverage Loading
     #----------------------------------------------------------------------
 
-    def load_coverage_batch(self, filepaths, batch_name, progress_callback=logger.debug):
+    def load_coverage_batch(self, filepaths, batch_name, headless=False, progress_callback=logger.debug):
         """
         Create a new database coverage mapping from a list of coverage files.
 
@@ -393,7 +393,7 @@ class CoverageDirector(object):
             # attempt to load coverage data from disk
             try:
                 coverage_file = self.reader.open(filepath)
-                coverage_addresses = self._extract_coverage_data(coverage_file)
+                coverage_addresses = self._extract_coverage_data(coverage_file, headless=headless)
 
             # save and suppress warnings generated from loading coverage files
             except CoverageParsingError as e:
@@ -432,7 +432,7 @@ class CoverageDirector(object):
         # return the created coverage name
         return (coverage, errors)
 
-    def load_coverage_files(self, filepaths, progress_callback=logger.debug):
+    def load_coverage_files(self, filepaths, headless=False, progress_callback=logger.debug):
         """
         Create new database coverage mappings from a list of coverage files.
 
@@ -469,7 +469,7 @@ class CoverageDirector(object):
             # attempt to load coverage data from disk
             try:
                 coverage_file = self.reader.open(filepath)
-                coverage_addresses = self._extract_coverage_data(coverage_file)
+                coverage_addresses = self._extract_coverage_data(coverage_file, headless=headless)
 
             # save and suppress warnings generated from loading coverage files
             except CoverageParsingError as e:
@@ -518,7 +518,7 @@ class CoverageDirector(object):
         # all done
         return (all_coverage, errors)
 
-    def _extract_coverage_data(self, coverage_file):
+    def _extract_coverage_data(self, coverage_file, headless=False):
         """
         Internal routine to extract relevant coverage data from a CoverageFile.
         """
@@ -543,6 +543,10 @@ class CoverageDirector(object):
         #
 
         if not module_name and coverage_file.modules:
+
+            # headless mode: skip UI dialogs and return empty data
+            if headless:
+                return []
 
             #
             # earlier in this load, the user opted to ignore future attempts

@@ -33,7 +33,7 @@ class CoverageException(LighthouseError):
         return "Error: %s\n\n%s" % (self.name, self.description)
 
     def __str__(self):
-        return self.message + " '%s'" % self.filepath
+        return str(self.args[0]) + " '%s'" % self.filepath
 
 class CoverageParsingError(CoverageException):
     """

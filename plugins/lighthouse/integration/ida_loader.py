@@ -66,6 +66,11 @@ class LighthouseIDAPlugin(idaapi.plugin_t):
         except Exception as e:
             lmsg("Failed to initialize Lighthouse")
             logger.exception("Exception details:")
+
+        # schedule context initialization on main thread for MCP readiness
+        if getattr(self._lighthouse, '_mcp_started', False):
+            _schedule_mcp_init(self._lighthouse)
+
         return idaapi.PLUGIN_KEEP
 
     def run(self, arg):
@@ -91,4 +96,25 @@ class LighthouseIDAPlugin(idaapi.plugin_t):
         logger.debug("-"*50)
 
         logger.debug("IDA term done... (%.3f seconds...)" % (end-start))
+
+
+def _schedule_mcp_init(lighthouse):
+    """
+    Use a one-shot timer to initialize the Lighthouse context on the main thread.
+    Waits for auto-analysis to finish before caching metadata.
+    """
+    def _on_timer():
+        import ida_auto
+        if not ida_auto.auto_is_ok():
+            return 1000  # analysis not done, retry in 1 second
+        try:
+            lctx = lighthouse.get_context(None)
+            if not lctx.metadata.cached:
+                lctx.metadata.refresh()
+            logger.info("Lighthouse context initialized for MCP")
+        except Exception:
+            logger.exception("Failed to initialize Lighthouse context for MCP")
+        return -1  # -1 = don't repeat
+
+    idaapi.register_timer(1000, _on_timer)
 

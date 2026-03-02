@@ -42,22 +42,35 @@ class LighthouseCore(object):
 
         # the plugin color palette
         self.palette = LighthousePalette()
-        self.palette.theme_changed(self.refresh_theme)
 
-        def create_coverage_overview(name, parent, dctx):
-            lctx = self.get_context(dctx, startup=False)
-            widget = disassembler.create_dockable_widget(parent, name)
-            overview = CoverageOverview(lctx, widget)
-            return widget
+        if not disassembler.headless:
+            self.palette.theme_changed(self.refresh_theme)
 
-        # the coverage overview widget
-        disassembler.register_dockable("Coverage Overview", create_coverage_overview)
+            def create_coverage_overview(name, parent, dctx):
+                lctx = self.get_context(dctx, startup=False)
+                widget = disassembler.create_dockable_widget(parent, name)
+                overview = CoverageOverview(lctx, widget)
+                return widget
 
-        # install disassembler UI
-        self._install_ui()
+            # the coverage overview widget
+            disassembler.register_dockable("Coverage Overview", create_coverage_overview)
+
+            # install disassembler UI
+            self._install_ui()
 
         # install entry point for headless / terminal access...
         lighthouse.get_context = self.get_context
+
+        # MCP server: start immediately if available
+        self._mcp_started = False
+        try:
+            from lighthouse.mcp_server import start_mcp_server
+            start_mcp_server(self.get_context)
+            self._mcp_started = True
+        except ImportError:
+            pass
+        except Exception:
+            logger.exception("Failed to start MCP server")
 
         # plugin loaded successfully, print the plugin banner
         self.print_banner()
@@ -67,7 +80,15 @@ class LighthouseCore(object):
         """
         Unload the plugin, and remove any UI integrations.
         """
-        self._uninstall_ui()
+        if getattr(self, '_mcp_started', False):
+            try:
+                from lighthouse.mcp_server import stop_mcp_server
+                stop_mcp_server()
+            except Exception:
+                pass
+
+        if not disassembler.headless:
+            self._uninstall_ui()
 
         # remove headless entry point
         lighthouse.get_context = lambda x: None
