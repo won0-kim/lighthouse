@@ -599,12 +599,43 @@ class CoverageDirector(object):
             pass
 
         #
-        # (module, offset) style logs (eg, mod+off)
+        # (module, offset) style logs (eg, mod+off, TinyInst)
+        #
+        # expand each offset to its containing basic block using metadata
+        # so that the entire BB is marked as covered, not just the hit address
         #
 
         try:
             coverage_offsets = coverage_file.get_offsets(module_name)
-            coverage_addresses = [imagebase+offset for offset in coverage_offsets]
+
+            # build a sorted node lookup table for BB expansion
+            import bisect
+            node_list = sorted(
+                [(addr, node.size) for addr, node in self.metadata.nodes.items()]
+            )
+            node_keys = [addr for addr, size in node_list]
+
+            coverage_addresses = []
+            seen_nodes = set()
+
+            for offset in coverage_offsets:
+                abs_addr = imagebase + offset
+
+                # find the BB node containing this address
+                idx = bisect.bisect_right(node_keys, abs_addr) - 1
+                if idx >= 0:
+                    node_addr, node_size = node_list[idx]
+                    if node_addr <= abs_addr < node_addr + node_size:
+                        if node_addr not in seen_nodes:
+                            seen_nodes.add(node_addr)
+                            coverage_addresses.extend(
+                                range(node_addr, node_addr + node_size)
+                            )
+                        continue
+
+                # fallback: no matching node, use the raw address
+                coverage_addresses.append(abs_addr)
+
             return coverage_addresses
         except NotImplementedError:
             pass
