@@ -411,13 +411,21 @@ def _decompile_with_coverage(func_addr, covered_addrs):
 
 
 @mcp.tool()
-def get_function_coverage(function_name: str, coverage_name: str = "") -> dict:
+def get_function_coverage(function_name: str, coverage_name: str = "", offset: int = 0, limit: int = 0, filter: str = "", compact: bool = True) -> dict:
     """
     Get decompiled pseudocode of a function with per-line coverage annotation.
 
     Returns decompiled pseudocode where each line is marked as covered (true),
     not covered (false), or unknown (null). Useful for identifying exactly
     which code paths are missed. If coverage_name is omitted, uses the aggregate.
+
+    Args:
+        offset: Skip the first N pseudocode lines (0-based). Default 0.
+        limit:  Return at most N pseudocode lines. 0 means all. Default 0.
+        filter: Filter lines by coverage status: "uncovered", "covered", or "" (all). Default "".
+        compact: If true, return pseudocode as a compact text string instead of JSON array.
+                 Format: "[+] covered_line" / "[-] uncovered_line" / "[ ] unknown_line".
+                 This dramatically reduces output size. Default true.
     """
     logger.info("get_function_coverage called: function_name=%r, coverage_name=%r", function_name, coverage_name)
     lctx = _resolve_context()
@@ -476,7 +484,41 @@ def get_function_coverage(function_name: str, coverage_name: str = "") -> dict:
     }
 
     if decompiled_lines is not None:
-        result["pseudocode"] = decompiled_lines
+        total_lines = len(decompiled_lines)
+
+        # apply filter
+        filter_lower = filter.lower()
+        if filter_lower == "uncovered":
+            decompiled_lines = [l for l in decompiled_lines if l["covered"] is False]
+        elif filter_lower == "covered":
+            decompiled_lines = [l for l in decompiled_lines if l["covered"] is True]
+
+        filtered_count = len(decompiled_lines)
+
+        # apply pagination
+        if offset > 0:
+            decompiled_lines = decompiled_lines[offset:]
+        if limit > 0:
+            decompiled_lines = decompiled_lines[:limit]
+
+        if compact:
+            # compact text format: much smaller than JSON array
+            markers = {True: "[+]", False: "[-]", None: "[ ]"}
+            lines_text = []
+            for l in decompiled_lines:
+                marker = markers.get(l["covered"], "[ ]")
+                lines_text.append("%s %4d: %s" % (marker, l["line"], l["text"]))
+            result["pseudocode"] = "\n".join(lines_text)
+        else:
+            result["pseudocode"] = decompiled_lines
+
+        result["total_lines"] = total_lines
+        result["filtered_lines"] = filtered_count
+        result["returned_lines"] = len(decompiled_lines) if not compact else len(lines_text)
+        if filter_lower:
+            result["filter"] = filter_lower
+        if offset > 0:
+            result["offset"] = offset
 
     return result
 
