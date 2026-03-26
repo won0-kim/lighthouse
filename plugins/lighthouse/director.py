@@ -601,42 +601,15 @@ class CoverageDirector(object):
         #
         # (module, offset) style logs (eg, mod+off, TinyInst)
         #
-        # expand each offset to its containing basic block using metadata
-        # so that the entire BB is marked as covered, not just the hit address
+        # expand each offset to the next call boundary within its node,
+        # so that coverage stops at call instructions rather than
+        # over-counting the entire node
         #
 
         try:
             coverage_offsets = coverage_file.get_offsets(module_name)
-
-            # build a sorted node lookup table for BB expansion
-            import bisect
-            node_list = sorted(
-                [(addr, node.size) for addr, node in self.metadata.nodes.items()]
-            )
-            node_keys = [addr for addr, size in node_list]
-
-            coverage_addresses = []
-            seen_nodes = set()
-
-            for offset in coverage_offsets:
-                abs_addr = imagebase + offset
-
-                # find the BB node containing this address
-                idx = bisect.bisect_right(node_keys, abs_addr) - 1
-                if idx >= 0:
-                    node_addr, node_size = node_list[idx]
-                    if node_addr <= abs_addr < node_addr + node_size:
-                        if node_addr not in seen_nodes:
-                            seen_nodes.add(node_addr)
-                            coverage_addresses.extend(
-                                range(node_addr, node_addr + node_size)
-                            )
-                        continue
-
-                # fallback: no matching node, use the raw address
-                coverage_addresses.append(abs_addr)
-
-            return coverage_addresses
+            abs_addrs = [imagebase + offset for offset in coverage_offsets]
+            return self._expand_to_call_boundaries(abs_addrs)
         except NotImplementedError:
             pass
 
@@ -646,12 +619,98 @@ class CoverageDirector(object):
 
         try:
             coverage_addresses = coverage_file.get_addresses(module_name)
-            return coverage_addresses
+            return self._expand_to_call_boundaries(list(coverage_addresses))
         except NotImplementedError:
             pass
 
         # well, this one is probably the fault of the CoverageFile author...
         raise NotImplementedError("Incomplete CoverageFile implementation")
+
+    def _get_call_boundaries(self, node_ranges):
+        """
+        Query the disassembler for call instruction locations within nodes.
+        Returns {node_addr: sorted list of (call_addr, call_end_addr)}
+        """
+        import idaapi, idc
+
+        call_map = {}
+        for node_addr, node_size in node_ranges:
+            calls = []
+            cur = node_addr
+            end = node_addr + node_size
+            while cur < end and cur != idc.BADADDR:
+                mnem = idc.print_insn_mnem(cur)
+                nxt = idc.next_head(cur, end)
+                if nxt == idc.BADADDR:
+                    nxt = end
+                if mnem in ('BL', 'BLX', 'CALL'):
+                    calls.append((cur, nxt))
+                cur = nxt
+            if calls:
+                call_map[node_addr] = calls
+        return call_map
+
+    def _expand_to_call_boundaries(self, hit_addrs):
+        """
+        Expand a list of hit addresses to coverage ranges that stop at
+        call instruction boundaries.
+
+        For each hit, coverage extends from the hit address forward to
+        the next call instruction (inclusive) or node end within the
+        containing basic block. This avoids over-counting code after
+        calls that may have crashed.
+        """
+        import bisect
+
+        node_list = sorted(
+            [(addr, node.size) for addr, node in self.metadata.nodes.items()]
+        )
+        node_keys = [addr for addr, size in node_list]
+
+        # collect nodes that contain hits
+        hit_nodes = set()
+        for abs_addr in hit_addrs:
+            idx = bisect.bisect_right(node_keys, abs_addr) - 1
+            if idx >= 0:
+                node_addr, node_size = node_list[idx]
+                if node_addr <= abs_addr < node_addr + node_size:
+                    hit_nodes.add((node_addr, node_size))
+
+        # batch query call boundaries
+        call_map = self._get_call_boundaries(list(hit_nodes)) if hit_nodes else {}
+
+        coverage_addresses = []
+        seen_ranges = set()
+
+        for abs_addr in sorted(hit_addrs):
+            idx = bisect.bisect_right(node_keys, abs_addr) - 1
+            if idx >= 0:
+                node_addr, node_size = node_list[idx]
+                if node_addr <= abs_addr < node_addr + node_size:
+                    node_end = node_addr + node_size
+
+                    # default: extend to node end
+                    range_end = node_end
+
+                    # stop at the first call at or after the hit
+                    if node_addr in call_map:
+                        for call_addr, call_end in call_map[node_addr]:
+                            if call_addr >= abs_addr:
+                                range_end = call_end
+                                break
+
+                    key = (abs_addr, range_end)
+                    if key not in seen_ranges:
+                        seen_ranges.add(key)
+                        coverage_addresses.extend(
+                            range(abs_addr, range_end)
+                        )
+                    continue
+
+            # fallback: no matching node
+            coverage_addresses.append(abs_addr)
+
+        return coverage_addresses
 
     def _suggest_coverage_name(self, filepath):
         """
