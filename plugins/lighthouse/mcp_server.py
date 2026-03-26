@@ -65,58 +65,181 @@ def _is_tinyinst(filepath):
         return False
 
 
-def _tinyinst_to_drcov(filepath, metadata=None):
+def _is_address_trace(filepath):
     """
-    Convert a TinyInst coverage file to a temporary drcov v2 file.
-    If metadata is provided, uses actual node sizes from IDA for accurate mapping.
-    Returns the path to the temporary drcov file.
+    Check if a file looks like an address trace (one hex address per line).
+    """
+    try:
+        with open(filepath, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if "+" in line:
+                    return False
+                int(line, 16)
+                return True
+    except Exception:
+        return False
+
+
+def _tinyinst_to_addresses(filepath):
+    """
+    Parse a TinyInst coverage file (module+offset per line).
+    Returns dict of {module_name: set of offsets}.
     """
     modules = defaultdict(set)
     with open(filepath, "r") as f:
         for line in f:
             line = line.strip()
-            if "+" not in line:
+            if not line or "+" not in line:
                 continue
             mod, off_str = line.split("+", 1)
+            off_str = off_str.split()[0]  # strip annotations like "(FUNC_NAME)"
             try:
                 offset = int(off_str, 16)
                 modules[mod].add(offset)
             except ValueError:
                 continue
+    return dict(modules)
 
-    if not modules:
+
+def _trace_to_addresses(filepath, metadata):
+    """
+    Parse an address trace file (one hex VA per line).
+    Converts absolute VAs to imagebase-relative offsets.
+    Returns dict of {module_name: set of offsets}.
+    """
+    imagebase = metadata.imagebase if metadata and metadata.cached else 0
+    module_name = metadata.filename if metadata else "unknown"
+    offsets = set()
+    with open(filepath, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                addr = int(line, 16)
+                offsets.add(addr - imagebase)
+            except ValueError:
+                continue
+    if not offsets:
+        return {}
+    return {module_name: offsets}
+
+
+def _get_call_boundaries(node_ranges):
+    """
+    Query IDA for call instruction locations within the given nodes.
+    node_ranges: list of (node_va, node_size)
+    Returns {node_va: sorted list of (call_va, call_end_va)}
+    """
+    import idaapi
+    result = [None]
+
+    def _do():
+        import idc
+        call_map = {}
+        for node_va, node_size in node_ranges:
+            calls = []
+            cur = node_va
+            end = node_va + node_size
+            while cur < end and cur != idc.BADADDR:
+                mnem = idc.print_insn_mnem(cur)
+                nxt = idc.next_head(cur, end)
+                if nxt == idc.BADADDR:
+                    nxt = end
+                if mnem in ('BL', 'BLX', 'CALL'):
+                    calls.append((cur, nxt))
+                cur = nxt
+            if calls:
+                call_map[node_va] = calls
+        result[0] = call_map
+
+    idaapi.execute_sync(_do, idaapi.MFF_READ)
+    return result[0]
+
+
+def _addresses_to_drcov(module_offsets, metadata=None):
+    """
+    Convert coverage offsets to a temporary drcov v2 file with
+    call-boundary-aware BB expansion.
+
+    For each hit, coverage extends from the hit address to the next call
+    instruction (inclusive) or node end. If execution returns from a call,
+    TinyInst logs the return address as a new hit, so coverage resumes there.
+
+    module_offsets: dict of {module_name: set of offsets relative to imagebase}
+    metadata: Lighthouse metadata for node/call info.
+    Returns path to temp drcov file, or None.
+    """
+    if not module_offsets:
         return None
 
-    # build sorted node list from metadata for range lookup
     import bisect
-    node_offsets = []  # sorted list of (offset, size)
-    node_offset_keys = []  # just offsets for bisect
+
+    node_offsets = []     # sorted list of (rel_offset, size, node_va)
+    node_offset_keys = [] # just rel_offsets for bisect
+    imagebase = 0
+    call_map = {}
+
     if metadata and metadata.cached:
         imagebase = metadata.imagebase
+
         for node_addr, node_meta in metadata.nodes.items():
-            node_offsets.append((node_addr - imagebase, node_meta.size))
+            rel = node_addr - imagebase
+            node_offsets.append((rel, node_meta.size, node_addr))
         node_offsets.sort()
         node_offset_keys = [n[0] for n in node_offsets]
 
-    mod_list = sorted(modules.keys())
+        # collect only nodes that contain hits, then batch query calls
+        hit_nodes = set()
+        for offsets in module_offsets.values():
+            for offset in offsets:
+                idx = bisect.bisect_right(node_offset_keys, offset) - 1
+                if idx >= 0:
+                    node_off, node_sz, node_va = node_offsets[idx]
+                    if node_off <= offset < node_off + node_sz:
+                        hit_nodes.add((node_va, node_sz))
+
+        if hit_nodes:
+            call_map = _get_call_boundaries(list(hit_nodes))
+
+    mod_list = sorted(module_offsets.keys())
     mod_index = {name: i for i, name in enumerate(mod_list)}
 
     bb_entries = []
-    seen_nodes = set()
+    seen_ranges = set()
+
     for mod_name in mod_list:
         mid = mod_index[mod_name]
-        for offset in sorted(modules[mod_name]):
+        for offset in sorted(module_offsets[mod_name]):
             if node_offset_keys:
-                # find the IDA node containing this offset
                 idx = bisect.bisect_right(node_offset_keys, offset) - 1
                 if idx >= 0:
-                    node_off, node_sz = node_offsets[idx]
+                    node_off, node_sz, node_va = node_offsets[idx]
                     if node_off <= offset < node_off + node_sz:
-                        # emit the whole IDA node instead
-                        if node_off not in seen_nodes:
-                            seen_nodes.add(node_off)
-                            bb_entries.append((node_off, node_sz, mid))
+                        hit_va = offset + imagebase
+                        node_end_va = node_va + node_sz
+
+                        # default: extend to node end
+                        range_end_va = node_end_va
+
+                        # stop at the first call at or after the hit
+                        if node_va in call_map:
+                            for call_va, call_end_va in call_map[node_va]:
+                                if call_va >= hit_va:
+                                    range_end_va = call_end_va
+                                    break
+
+                        range_start = offset
+                        range_size = range_end_va - hit_va
+                        key = (range_start, range_size)
+                        if key not in seen_ranges:
+                            seen_ranges.add(key)
+                            bb_entries.append((range_start, range_size, mid))
                         continue
+
             # fallback: no metadata or offset not in any node
             bb_entries.append((offset, 1, mid))
 
@@ -160,7 +283,7 @@ def load_coverage(filepaths: list[str]) -> dict:
     if not lctx.metadata.cached:
         return {"error": "Database metadata not yet cached. Please open the Coverage Overview in IDA first, then retry."}
 
-    # validate file existence and convert TinyInst files to drcov
+    # validate file existence and convert custom formats to drcov
     errors = []
     valid_paths = []
     tmp_files = []
@@ -169,17 +292,23 @@ def load_coverage(filepaths: list[str]) -> dict:
             errors.append("File not found: %s" % fp)
             continue
 
-        # detect TinyInst format and convert to drcov
+        # detect format and convert to drcov with call-aware BB expansion
+        module_offsets = None
         if _is_tinyinst(fp):
+            module_offsets = _tinyinst_to_addresses(fp)
+        elif _is_address_trace(fp):
+            module_offsets = _trace_to_addresses(fp, lctx.metadata)
+
+        if module_offsets is not None:
             try:
-                tmp_path = _tinyinst_to_drcov(fp, metadata=lctx.metadata)
+                tmp_path = _addresses_to_drcov(module_offsets, metadata=lctx.metadata)
                 if tmp_path:
                     valid_paths.append(tmp_path)
                     tmp_files.append(tmp_path)
                 else:
-                    errors.append("No coverage data in TinyInst file: %s" % fp)
+                    errors.append("No coverage data in file: %s" % fp)
             except Exception as e:
-                errors.append("Failed to convert TinyInst file %s: %s" % (fp, e))
+                errors.append("Failed to convert coverage file %s: %s" % (fp, e))
         else:
             valid_paths.append(fp)
 
@@ -411,13 +540,21 @@ def _decompile_with_coverage(func_addr, covered_addrs):
 
 
 @mcp.tool()
-def get_function_coverage(function_name: str, coverage_name: str = "") -> dict:
+def get_function_coverage(function_name: str, coverage_name: str = "", offset: int = 0, limit: int = 0, filter: str = "", compact: bool = True) -> dict:
     """
     Get decompiled pseudocode of a function with per-line coverage annotation.
 
     Returns decompiled pseudocode where each line is marked as covered (true),
     not covered (false), or unknown (null). Useful for identifying exactly
     which code paths are missed. If coverage_name is omitted, uses the aggregate.
+
+    Args:
+        offset: Skip the first N pseudocode lines (0-based). Default 0.
+        limit:  Return at most N pseudocode lines. 0 means all. Default 0.
+        filter: Filter lines by coverage status: "uncovered", "covered", or "" (all). Default "".
+        compact: If true, return pseudocode as a compact text string instead of JSON array.
+                 Format: "[+] covered_line" / "[-] uncovered_line" / "[ ] unknown_line".
+                 This dramatically reduces output size. Default true.
     """
     logger.info("get_function_coverage called: function_name=%r, coverage_name=%r", function_name, coverage_name)
     lctx = _resolve_context()
@@ -476,7 +613,41 @@ def get_function_coverage(function_name: str, coverage_name: str = "") -> dict:
     }
 
     if decompiled_lines is not None:
-        result["pseudocode"] = decompiled_lines
+        total_lines = len(decompiled_lines)
+
+        # apply filter
+        filter_lower = filter.lower()
+        if filter_lower == "uncovered":
+            decompiled_lines = [l for l in decompiled_lines if l["covered"] is False]
+        elif filter_lower == "covered":
+            decompiled_lines = [l for l in decompiled_lines if l["covered"] is True]
+
+        filtered_count = len(decompiled_lines)
+
+        # apply pagination
+        if offset > 0:
+            decompiled_lines = decompiled_lines[offset:]
+        if limit > 0:
+            decompiled_lines = decompiled_lines[:limit]
+
+        if compact:
+            # compact text format: much smaller than JSON array
+            markers = {True: "[+]", False: "[-]", None: "[ ]"}
+            lines_text = []
+            for l in decompiled_lines:
+                marker = markers.get(l["covered"], "[ ]")
+                lines_text.append("%s %4d: %s" % (marker, l["line"], l["text"]))
+            result["pseudocode"] = "\n".join(lines_text)
+        else:
+            result["pseudocode"] = decompiled_lines
+
+        result["total_lines"] = total_lines
+        result["filtered_lines"] = filtered_count
+        result["returned_lines"] = len(decompiled_lines) if not compact else len(lines_text)
+        if filter_lower:
+            result["filter"] = filter_lower
+        if offset > 0:
+            result["offset"] = offset
 
     return result
 
