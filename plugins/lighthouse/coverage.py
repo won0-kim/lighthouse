@@ -492,6 +492,23 @@ class DatabaseCoverage(object):
         # addresses into their respective child instructions
         #
 
+        if not instructions:
+            bad_addrs = sorted(coverage_addresses - self._metadata.instructions)
+            preview = ", ".join("0x%X" % a for a in bad_addrs[:10])
+            if len(bad_addrs) > 10:
+                preview += " ... (%d total)" % len(bad_addrs)
+            msg = (
+                "No valid instructions in coverage data.\n"
+                "Addresses not matching any known instruction:\n[%s]" % preview
+            )
+            logger.error(msg)
+            try:
+                import idaapi
+                idaapi.warning(msg)
+            except Exception:
+                pass
+            return
+
         block_ratio = len(basic_blocks) / float(len(instructions))
         block_trace_confidence = 0.80
         logger.debug("Block confidence %f" % block_ratio)

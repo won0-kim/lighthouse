@@ -689,6 +689,13 @@ class CoverageDirector(object):
                 if node_addr <= abs_addr < node_addr + node_size:
                     node_end = node_addr + node_size
 
+                    # start from the node beginning, not the hit address.
+                    # within a node there are no branches before the hit,
+                    # so everything from node start to hit was executed.
+                    # this also avoids 'suspicious' false positives where
+                    # the node start address is missing from coverage.
+                    range_start = node_addr
+
                     # default: extend to node end
                     range_end = node_end
 
@@ -699,11 +706,11 @@ class CoverageDirector(object):
                                 range_end = call_end
                                 break
 
-                    key = (abs_addr, range_end)
+                    key = (range_start, range_end)
                     if key not in seen_ranges:
                         seen_ranges.add(key)
                         coverage_addresses.extend(
-                            range(abs_addr, range_end)
+                            range(range_start, range_end)
                         )
                     continue
 

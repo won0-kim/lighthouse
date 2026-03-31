@@ -222,6 +222,9 @@ def _addresses_to_drcov(module_offsets, metadata=None):
                         hit_va = offset + imagebase
                         node_end_va = node_va + node_sz
 
+                        # start from node beginning (no branches before hit)
+                        range_start = node_off
+
                         # default: extend to node end
                         range_end_va = node_end_va
 
@@ -232,8 +235,7 @@ def _addresses_to_drcov(module_offsets, metadata=None):
                                     range_end_va = call_end_va
                                     break
 
-                        range_start = offset
-                        range_size = range_end_va - hit_va
+                        range_size = range_end_va - node_va
                         key = (range_start, range_size)
                         if key not in seen_ranges:
                             seen_ranges.add(key)
